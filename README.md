@@ -77,7 +77,8 @@
 
 **3-2. H/W 구성도**
 
-![Uploading image.png…]()
+<img width="2274" height="1556" alt="image" src="https://github.com/user-attachments/assets/038b2938-70bd-4d2e-8f9d-428772ce74d1" />
+
 
 
 | 구성 | 부품 |
