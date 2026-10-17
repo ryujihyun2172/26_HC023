@@ -70,14 +70,16 @@
 
 **3-1. S/W 구성도**
 
-<!-- 여기에 S/W 구성도 사진을 끌어다 놓기 -->
+<img width="1526" height="1004" alt="image" src="https://github.com/user-attachments/assets/9eb0c517-42fd-4bc8-8503-fe63827b183b" />
+
 
 - 사용자 로그인 후 시스템 및 센서를 초기화하고, 운동 모드(보조/저항)를 선택하면 모드에 맞게 모터 구동 배율을 적용합니다.
 - 훈련 중 실시간으로 GUI에 표시하고 데이터를 저장하며, 운동 종료 명령을 받으면 재활 분석 리포트를 생성합니다.
 
 **3-2. H/W 구성도**
 
-<img width="2274" height="1556" alt="image" src="https://github.com/user-attachments/assets/038b2938-70bd-4d2e-8f9d-428772ce74d1" />
+<img width="2118" height="1470" alt="image" src="https://github.com/user-attachments/assets/dde71839-d2d1-4c4a-aaa4-ce8cc5521796" />
+
 
 
 
