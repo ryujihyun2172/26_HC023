@@ -642,39 +642,158 @@ void loop() {
 
 ```
 
-**5-2. 라즈베리파이 명령 기반 아두이노 모터 구동 (Arduino)**
+**5-2. 방향·힘 → 목표 위치 이동 벡터 → IK 호출 (Raspberry Pi / Qt C++)**
 
-- 라즈베리파이에서 시리얼로 받은 명령을 한 줄 단위로 버퍼에 모아 처리합니다.
-- `M` 명령이면 두 모터의 PWM 값을 읽어 `applyMotorCommand()`로 모터를 구동하고, 그 외 명령은 관리자 명령으로 처리합니다.
-
-```cpp
-// readSerialCommands(), processLine() 코드 붙여넣기
-```
-
-**5-3. 라즈베리파이와 아두이노 메가 간의 통신 (Qt / C++)**
-
-- `SerialManager` 클래스가 시리얼 포트 연결, 시작/정지 명령 전송, 데이터 수신을 담당합니다.
-- 아두이노에서 받은 패킷을 `,` 기준으로 나누고 `FORCE:`, `ANGLE:` 값을 파싱해 센서 데이터로 갱신합니다.
+- 제어 흐름의 중심으로, 사용자가 힘을 준 **의도**가 로봇의 **이동 목표**로 바뀌는 부분입니다.
+- 아두이노에서 받은 방향과 힘 크기를 좌우(LR)·앞뒤(FB) 성분으로 분해합니다.
+- 보조 / 저항 / 자유 모드의 차이는 여기서 `modeScale` 배율로 만들어집니다.
+- 배율이 적용된 힘을 이동량으로 바꿔 현재 위치에 누적(오픈루프)하고, 목표 위치로 IK를 계산합니다.
 
 ```cpp
-// SerialManager.cpp 핵심 부분 (readData, parsePacket 등) 붙여넣기
+// 방향 + 힘 크기 → 좌우/앞뒤 성분
+int lrSign = 0, fbSign = 0;
+directionToAxis(data.direction, lrSign, fbSign);
+double magnitude = dominantMagnitude(data);
+rawLr = lrSign * magnitude;
+rawFb = fbSign * magnitude;
+
+// 모드별 배율 (Assist / Resist / Free)
+double lr = rawLr * modeScale;
+double fb = rawFb * modeScale;
+
+// 힘 → 목표 위치 이동 벡터
+double stepPx = lr * stepGain;
+double stepPy = -fb * stepGain;
+
+// 오픈루프 누적
+double targetPx = currentPx + stepPx;
+double targetPy = currentPy + stepPy;
+
+// IK 계산
+double theta1Deg, theta2Deg;
+bool ok = computeIK(targetPx, targetPy, theta1Deg, theta2Deg);
 ```
 
-**5-4. 라즈베리파이 메인 코드 (Qt / C++)**
+**5-3. 역기구학(IK) 계산 — computeIK (Raspberry Pi / Qt C++)**
 
-- 시리얼, 센서 처리, 데이터베이스, 소켓 서버, 리포트 모듈을 초기화하고 서로 연결합니다.
-- 게임 클라이언트가 보낸 방향 명령(`up`, `down`, `left`, `right`, `stop`)을 PWM 값으로 바꿔 아두이노로 전달합니다.
-- 운동 세션의 시작·종료와 데이터 저장, 재활 리포트 생성을 관리합니다.
+- 직교좌표 목표 위치 `(Px, Py)`를 두 모터(AB, AD)의 관절각으로 바꿔주는 수학적 핵심 함수입니다.
+- 로봇 기구(마름모형 4절 링크, L = 225mm)에 종속된 유일한 코드입니다.
+- 목표가 최대 도달 범위를 넘으면 같은 방향으로 범위 안까지 줄이고, 최소 거리보다 가까우면 특이점으로 보고 계산하지 않습니다.
+- 목표 방향 각도 φ와 링크 벌어짐 각도 β로 두 관절각을 구합니다.
 
 ```cpp
-// main.cpp 핵심 부분 붙여넣기
+bool ExerciseController::computeIK(double px, double py, double &theta1Deg, double &theta2Deg) const
+{
+    double r = qSqrt(px * px + py * py);
+
+    if (r > kMaxReachMM) {            // 도달 범위 초과 시 스케일 다운
+        double scale = kMaxReachMM / r;
+        px *= scale; py *= scale;
+        r = kMaxReachMM;
+    }
+    if (r < kMinReachMM)              // 특이점 회피
+        return false;
+
+    double phiRad  = qAtan2(py, px);
+    double betaRad = qAcos(qBound(-1.0, r / kMaxReachMM, 1.0));
+
+    double phiDeg  = qRadiansToDegrees(phiRad);
+    double betaDeg = qRadiansToDegrees(betaRad);
+
+    theta1Deg = -phiDeg - betaDeg;          // AB 모터
+    theta2Deg = 180.0 + phiDeg - betaDeg;   // AD 모터
+    return true;
+}
 ```
 
-**5-5. 게임 - 서버 TCP 통신 (Godot / GDScript)**
+**5-4. 관절각 변화량 → 모터 명령 (Raspberry Pi / Qt C++)**
 
-- `TCPManager.gd`는 Autoload 싱글톤으로, Qt 서버(`127.0.0.1:9000`)에 접속해 센서 데이터를 받습니다.
-- 수신한 JSON(`direction`, `dx`, `dy`, `force`, `intent`, `mode`)을 파싱해 게임 화면에 반영하고, 모드 변경 요청을 서버로 보냅니다.
+- 실제로 로봇이 움직이는 출구로, 목표 관절각과 현재 관절각의 차이를 모터 PWM 명령으로 바꿉니다.
+- 변화량이 데드밴드보다 작으면 모터를 움직이지 않아 미세한 떨림을 막습니다.
+- 변화량 크기로 PWM 세기를, 부호로 회전 방향을 정하고, 모터 장착 방향 보정값(`DirectionSign`)을 곱합니다.
+- 현재 위치·각도를 갱신한 뒤 두 모터의 PWM 명령을 아두이노로 보낼 수 있도록 시그널을 발생시킵니다.
+
+```cpp
+double deltaTheta1 = theta1Deg - currentTheta1Deg;
+double deltaTheta2 = theta2Deg - currentTheta2Deg;
+
+if (qAbs(deltaTheta1) > angleDeadbandDeg) {
+    int mag  = angleToPwm(qAbs(deltaTheta1));
+    int sign = (deltaTheta1 > 0) ? 1 : -1;
+    pwmAB = abDirectionSign * sign * mag;
+}
+if (qAbs(deltaTheta2) > angleDeadbandDeg) {
+    int mag  = angleToPwm(qAbs(deltaTheta2));
+    int sign = (deltaTheta2 > 0) ? 1 : -1;
+    pwmAD = adDirectionSign * sign * mag;
+}
+
+currentPx = targetPx;  currentPy = targetPy;
+currentTheta1Deg = theta1Deg;  currentTheta2Deg = theta2Deg;
+
+emit motorCommandReady(pwmAB, pwmAD);
+```
+
+**5-5. 게임 ↔ 서버 TCP 통신 (Godot / GDScript)**
+
+- `TCPManager.gd`는 Autoload 싱글톤으로, 게임 어느 화면에서든 같은 연결을 사용합니다.
+- 라즈베리파이 Qt 서버(`127.0.0.1:9000`)에 접속하고, 매 프레임 연결 상태를 확인합니다.
+- 서버가 줄 단위로 보내는 JSON을 파싱해 방향·이동량·힘·운동 의도·모드(`direction`, `dx`, `dy`, `force`, `intent`, `mode`)를 갱신하고, 각 게임은 이 값으로 캐릭터와 오브젝트를 움직입니다.
+- 게임은 모터를 직접 제어하지 않고 세션 시작·종료, 훈련 모드 선택 같은 **요청만** 서버로 보냅니다.
+- 서버 연결 전에 보낸 메시지는 대기열에 저장했다가 연결되면 한꺼번에 전송해, 명령이 유실되지 않도록 했습니다.
 
 ```gdscript
-# TCPManager.gd 핵심 부분 붙여넣기
+func _process(delta):
+	tcp.poll()
+	var status = tcp.get_status()
+	if status == StreamPeerTCP.STATUS_CONNECTED and not connected:
+		connected = true
+		print("서버 연결 성공")
+		_flush_pending_messages()
+	if status != StreamPeerTCP.STATUS_CONNECTED and connected:
+		connected = false
+		print("서버 연결 끊김 (상태: ", status, ")")
+	if connected and tcp.get_available_bytes() > 0:
+		var data = tcp.get_utf8_string(tcp.get_available_bytes())
+		for line in data.split("\n"):
+			if line.strip_edges() != "":
+				var json = JSON.parse_string(line)
+				if json:
+					current_direction = json.get("direction", "")
+					current_dx = json.get("dx", 0.0)
+					current_dy = json.get("dy", 0.0)
+					current_force = json.get("force", [])
+					current_intent = json.get("intent", false)
+					current_mode = json.get("mode", "")
+
+func _send_json(data: Dictionary) -> void:
+	var json_str = JSON.stringify(data) + "\n"
+	if connected:
+		tcp.put_data(json_str.to_utf8_buffer())
+	else:
+		_pending_messages.append(json_str)
+		print("서버 미연결 상태 - 메시지 대기열에 저장: ", data.get("command", ""))
+
+func _flush_pending_messages() -> void:
+	for msg in _pending_messages:
+		tcp.put_data(msg.to_utf8_buffer())
+	_pending_messages.clear()
+
+func send_start_session(user_id: String, age: int, gender: String) -> void:
+	current_user_id = user_id
+	_send_json({
+		"command": "start_session",
+		"user_id": user_id,
+		"age": age,
+		"gender": gender
+	})
+
+func send_end_session() -> void:
+	_send_json({"command": "end_session"})
+
+func send_training_mode(mode: String) -> void:
+	_send_json({
+		"command": "training_mode",
+		"mode": mode
+	})
 ```
