@@ -112,3 +112,11 @@
 **3-5. 테이블 정의서**
 
 <img width="1572" height="904" alt="image" src="https://github.com/user-attachments/assets/d8e526fb-30f0-434f-9a42-680058372ed1" />
+
+---
+
+## 💡 4. 작품 소개영상
+
+[![저비용, 고효율의 AI 기반 맞춤형 상지 재활 훈련 로봇 소개영상](https://youtu.be/Dy2TFdKQHPU?si=kVbJuoFrc86Vg3V9)](유튜브링크)
+
+> 이미지를 클릭하면 유튜브 영상으로 이동합니다.
