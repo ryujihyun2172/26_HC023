@@ -137,7 +137,509 @@
 - 두 번째 힘도 임계값 이상이고 두 힘의 비율이 기준 이상이면 대각선 방향으로, 아니면 가장 큰 힘의 방향으로 판별합니다.
 
 ```cpp
-// determineDirection() 코드 붙여넣기
+#include "HX711.h"
+#include <math.h>
+
+// =====================================================
+// 센서 개수
+// =====================================================
+const int SENSOR_COUNT = 4;
+
+// 센서 번호
+const int FRONT_SENSOR = 0;  // LC1
+const int LEFT_SENSOR  = 1;  // LC2
+const int RIGHT_SENSOR = 2;  // LC3
+const int BACK_SENSOR  = 3;  // LC4
+
+// =====================================================
+// HX711 핀 설정
+// =====================================================
+const byte DOUT_PINS[SENSOR_COUNT] = {
+  25,  // LC1 앞 DAT
+  26,  // LC2 왼쪽 DAT
+  27,  // LC3 오른쪽 DAT
+  28   // LC4 뒤 DAT
+};
+
+const byte SCK_PINS[SENSOR_COUNT] = {
+  29,  // LC1 앞 SCK
+  30,  // LC2 왼쪽 SCK
+  31,  // LC3 오른쪽 SCK
+  32   // LC4 뒤 SCK
+};
+
+HX711 scale[SENSOR_COUNT];
+
+// =====================================================
+// 센서 방향 이름
+// =====================================================
+const char* DIRECTION_NAME[SENSOR_COUNT] = {
+  "FRONT",
+  "LEFT",
+  "RIGHT",
+  "BACK"
+};
+
+// =====================================================
+// 센서별 보정계수 K
+// 단위: raw/g
+// =====================================================
+const float K_RAW_PER_G[SENSOR_COUNT] = {
+  222.5480,  // LC1: Up/Down average
+  222.3732,  // LC2: Up/Down average
+  224.0414,  // LC3: Up/Down average
+  225.4151   // LC4: Up/Down average
+};
+
+// =====================================================
+// 통신 및 방향 판단 설정
+// =====================================================
+const unsigned long BAUD_RATE = 115200;
+
+////////////// 값 조절 파라미터1 ////////////////
+// 0.02N보다 작으면 힘이 없는 것으로 판단
+const float FORCE_THRESHOLD_N = 0.02;
+
+
+// 센서별 무반응 구간
+// LC3 RIGHT만 무부하 오인식을 줄이기 위해 크게 설정
+const float SENSOR_DEADBAND_N[SENSOR_COUNT] = {
+  0.02,  // LC1 FRONT
+  0.02,  // LC2 LEFT
+  0.04,  // LC3 RIGHT
+  0.25   // LC4 BACK
+};
+
+
+////////////// 값 조절 파라미터2 ////////////////
+// 두 번째 힘이 가장 큰 힘의 55% 이상이면 대각선
+const float DIAGONAL_RATIO = 0.55;
+
+//////////////// 값 조절 파라미터3 /////////////
+// 100ms마다 측정 = 약 10Hz
+const unsigned long SEND_INTERVAL_MS = 100;
+
+
+//////////////// 값 조절 파라미터4 /////////////
+// 영점 측정 횟수
+const int ZERO_SAMPLE_COUNT = 50;
+
+
+
+// 센서별 영점 raw
+long zeroRaw[SENSOR_COUNT] = {
+  0, 0, 0, 0
+};
+
+unsigned long packetNumber = 0;
+unsigned long lastSendTime = 0;
+
+// =====================================================
+// 모든 HX711 준비 확인
+// =====================================================
+bool allSensorsReady() {
+  for (int sensor = 0;
+       sensor < SENSOR_COUNT;
+       sensor++) {
+
+    if (!scale[sensor].is_ready()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// =====================================================
+// 모든 HX711이 준비될 때까지 대기
+// =====================================================
+bool waitAllSensors(unsigned long timeoutMs) {
+  unsigned long startTime = millis();
+
+  while (!allSensorsReady()) {
+    if (millis() - startTime >= timeoutMs) {
+      return false;
+    }
+
+    delay(1);
+  }
+
+  return true;
+}
+
+// =====================================================
+// 센서 4개의 raw값 읽기
+// =====================================================
+bool readAllRaw(long raw[SENSOR_COUNT]) {
+  if (!waitAllSensors(200)) {
+    return false;
+  }
+
+  for (int sensor = 0;
+       sensor < SENSOR_COUNT;
+       sensor++) {
+
+    raw[sensor] = scale[sensor].read();
+  }
+
+  return true;
+}
+
+// =====================================================
+// 영점 설정
+// 실행 중에는 모든 센서에서 손을 떼야 함
+// =====================================================
+bool setZero() {
+  int64_t sum[SENSOR_COUNT] = {
+    0, 0, 0, 0
+  };
+
+  long raw[SENSOR_COUNT];
+
+  Serial.println("# ========================================");
+  Serial.println("# Do not press any load cell.");
+  Serial.println("# Measuring zero...");
+  Serial.println("# ========================================");
+
+  // 처음 불안정한 측정값 3개 버리기
+  for (int sample = 0; sample < 3; sample++) {
+    if (!readAllRaw(raw)) {
+      Serial.println("# ERROR: HX711 not ready");
+      return false;
+    }
+  }
+
+  // 센서별 영점 평균
+  for (int sample = 0;
+       sample < ZERO_SAMPLE_COUNT;
+       sample++) {
+
+    if (!readAllRaw(raw)) {
+      Serial.println("# ERROR: HX711 not ready");
+      return false;
+    }
+
+    for (int sensor = 0;
+         sensor < SENSOR_COUNT;
+         sensor++) {
+
+      sum[sensor] += raw[sensor];
+    }
+  }
+
+  for (int sensor = 0;
+       sensor < SENSOR_COUNT;
+       sensor++) {
+
+    zeroRaw[sensor] =
+        sum[sensor] / ZERO_SAMPLE_COUNT;
+
+    Serial.print("# ");
+    Serial.print(DIRECTION_NAME[sensor]);
+    Serial.print(" zeroRaw = ");
+    Serial.println(zeroRaw[sensor]);
+  }
+
+  Serial.println("# Zero setting complete.");
+  Serial.println("# ========================================");
+
+  return true;
+}
+
+// =====================================================
+// raw값을 힘 N으로 변환
+// =====================================================
+float calculateForceN(int sensor, long raw) {
+  // raw가 증가하거나 감소해도 변화량의 크기 사용
+  float rawDifference =
+      fabs((float)(raw - zeroRaw[sensor]));
+
+  // raw → g
+  float weightG =
+      rawDifference / K_RAW_PER_G[sensor];
+
+  // g → N
+  float forceN =
+      weightG * 0.00980665;
+
+  return forceN;
+}
+
+// =====================================================
+// 인접한 센서 조합을 대각선으로 변환
+// =====================================================
+const char* getDiagonalDirection(
+  int firstSensor,
+  int secondSensor
+) {
+  // 앞 + 왼쪽
+  if ((firstSensor == FRONT_SENSOR &&
+       secondSensor == LEFT_SENSOR) ||
+      (firstSensor == LEFT_SENSOR &&
+       secondSensor == FRONT_SENSOR)) {
+
+    return "FRONT_LEFT";
+  }
+
+  // 앞 + 오른쪽
+  if ((firstSensor == FRONT_SENSOR &&
+       secondSensor == RIGHT_SENSOR) ||
+      (firstSensor == RIGHT_SENSOR &&
+       secondSensor == FRONT_SENSOR)) {
+
+    return "FRONT_RIGHT";
+  }
+
+  // 뒤 + 왼쪽
+  if ((firstSensor == BACK_SENSOR &&
+       secondSensor == LEFT_SENSOR) ||
+      (firstSensor == LEFT_SENSOR &&
+       secondSensor == BACK_SENSOR)) {
+
+    return "BACK_LEFT";
+  }
+
+  // 뒤 + 오른쪽
+  if ((firstSensor == BACK_SENSOR &&
+       secondSensor == RIGHT_SENSOR) ||
+      (firstSensor == RIGHT_SENSOR &&
+       secondSensor == BACK_SENSOR)) {
+
+    return "BACK_RIGHT";
+  }
+
+  // 앞+뒤 또는 왼쪽+오른쪽이 동시에 큼
+  return "MIXED";
+}
+
+// =====================================================
+// 방향 판단
+// =====================================================
+const char* determineDirection(
+  const float forceN[SENSOR_COUNT]
+) {
+  int maxIndex = -1;
+  int secondIndex = -1;
+
+  // 가장 큰 힘과 두 번째로 큰 힘 찾기
+  for (int sensor = 0;
+       sensor < SENSOR_COUNT;
+       sensor++) {
+
+    if (maxIndex == -1 ||
+        forceN[sensor] > forceN[maxIndex]) {
+
+      secondIndex = maxIndex;
+      maxIndex = sensor;
+    }
+    else if (secondIndex == -1 ||
+             forceN[sensor] >
+             forceN[secondIndex]) {
+
+      secondIndex = sensor;
+    }
+  }
+
+  float maxForce = forceN[maxIndex];
+
+  // 모든 힘이 임계값 미만
+  if (maxForce < FORCE_THRESHOLD_N) {
+    return "NONE";
+  }
+
+  if (secondIndex != -1) {
+    float secondForce = forceN[secondIndex];
+
+    // 두 번째 힘도 임계값 이상인지 확인
+    if (secondForce >= FORCE_THRESHOLD_N) {
+      float ratio =
+          secondForce / maxForce;
+
+      // 두 힘이 비슷하면 대각선 판단
+      if (ratio >= DIAGONAL_RATIO) {
+        return getDiagonalDirection(
+          maxIndex,
+          secondIndex
+        );
+      }
+    }
+  }
+
+  // 대각선 조건이 아니면 가장 큰 힘의 방향
+  return DIRECTION_NAME[maxIndex];
+}
+
+// =====================================================
+// Raspberry Pi로 패킷 전송
+//
+// DATA,번호,시간,
+// 앞raw,앞N,
+// 왼쪽raw,왼쪽N,
+// 오른쪽raw,오른쪽N,
+// 뒤raw,뒤N,
+// 방향
+// =====================================================
+void sendPacket(
+  const long raw[SENSOR_COUNT],
+  const float forceN[SENSOR_COUNT],
+  const char* direction
+) {
+  packetNumber++;
+
+  Serial.print("DATA,");
+  Serial.print(packetNumber);
+  Serial.print(",");
+  Serial.print(millis());
+
+  for (int sensor = 0;
+       sensor < SENSOR_COUNT;
+       sensor++) {
+
+    Serial.print(",");
+    Serial.print(raw[sensor]);
+
+    Serial.print(",");
+    Serial.print(forceN[sensor], 4);
+  }
+
+  Serial.print(",");
+  Serial.println(direction);
+}
+
+// =====================================================
+// setup
+// =====================================================
+void setup() {
+  Serial.begin(BAUD_RATE);
+
+  // HX711 4개 초기화
+  for (int sensor = 0;
+       sensor < SENSOR_COUNT;
+       sensor++) {
+
+    pinMode(SCK_PINS[sensor], OUTPUT);
+    digitalWrite(SCK_PINS[sensor], LOW);
+
+    scale[sensor].begin(
+      DOUT_PINS[sensor],
+      SCK_PINS[sensor]
+    );
+  }
+
+  // HX711 안정화
+  delay(1500);
+
+  Serial.println();
+  Serial.println("# ========================================");
+  Serial.println("# Four Load Cell Direction System");
+  Serial.println("# LC1 = FRONT");
+  Serial.println("# LC2 = LEFT");
+  Serial.println("# LC3 = RIGHT");
+  Serial.println("# LC4 = BACK");
+  Serial.println("# ========================================");
+
+  // HX711 연결 상태 확인
+  if (!waitAllSensors(3000)) {
+    Serial.println(
+      "# ERROR: One or more HX711 modules are not ready."
+    );
+
+    Serial.println(
+      "# Check DAT, SCK, VCC, VDD and GND."
+    );
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // 영점 설정
+  if (!setZero()) {
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println(
+    "# Packet: DATA,packet,time_ms,"
+    "front_raw,front_N,"
+    "left_raw,left_N,"
+    "right_raw,right_N,"
+    "back_raw,back_N,"
+    "direction"
+  );
+
+  Serial.println("# Send T to reset zero.");
+  Serial.println();
+
+  lastSendTime = millis();
+}
+
+// =====================================================
+// loop
+// =====================================================
+void loop() {
+  // 시리얼 모니터에 T를 입력하면 영점 재설정
+  if (Serial.available() > 0) {
+    char command = Serial.read();
+
+    if (command == 'T' ||
+        command == 't') {
+
+      setZero();
+      lastSendTime = millis();
+    }
+  }
+
+  unsigned long now = millis();
+
+  // 100ms마다 측정
+  if (now - lastSendTime <
+      SEND_INTERVAL_MS) {
+
+    return;
+  }
+
+  long raw[SENSOR_COUNT];
+  float forceN[SENSOR_COUNT];
+
+  // 센서값 읽기
+  if (!readAllRaw(raw)) {
+    Serial.println("WARN,HX711_NOT_READY");
+    return;
+  }
+
+  lastSendTime = millis();
+
+  // 힘 계산
+  for (int sensor = 0;
+       sensor < SENSOR_COUNT;
+       sensor++) {
+
+    forceN[sensor] =
+        calculateForceN(sensor, raw[sensor]);
+
+    // 센서별 무반응 구간보다 작은 값은 힘이 없는 것으로 처리
+    if (forceN[sensor] <
+        SENSOR_DEADBAND_N[sensor]) {
+
+      forceN[sensor] = 0.0;
+    }
+  }
+
+  // 방향 판단
+  const char* direction =
+      determineDirection(forceN);
+
+  // Raspberry Pi로 전송
+  sendPacket(
+    raw,
+    forceN,
+    direction
+  );
+}
+
+
 ```
 
 **5-2. 라즈베리파이 명령 기반 아두이노 모터 구동 (Arduino)**
